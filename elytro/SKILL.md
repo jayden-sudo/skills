@@ -80,17 +80,14 @@ elytro --help
 
 ### From source (monorepo)
 
-If working within the Elytro monorepo:
+If working within the Elytro CLI [gitrepo](https://github.com/Elytro-eth/cli)
 
 ```bash
-cd apps/cli
-pnpm install
-pnpm build          # builds with tsup → dist/index.js
-pnpm dev --help     # run without building (uses tsx)
+bun install
+bun build          # builds with tsup → dist/index.js
+bun dev --help     # run without building (uses tsx)
 ```
-
-For development, `pnpm dev <command>` runs directly from TypeScript source via tsx.
-For production, `pnpm build` compiles to `dist/` and the `elytro` bin is linked from there.
+For production, `bun build` compiles to `dist/` and the `elytro` bin is linked from there.
 
 ---
 
