@@ -1,431 +1,909 @@
 ---
 name: elytro
-description: Ethereum EIP-4337 smart contract wallet designed for AI agents. Use this skill whenever the user wants to manage Ethereum accounts, check balances, send ETH/tokens, swap tokens on Uniswap, manage 2FA security hooks, or do anything with their Elytro wallet. Supports gasless transactions via sponsorship. For token swaps, combine this skill with `defi/uniswap` for planning and `defi/elytro` for execution.
+description: >
+  Elytro — security-first ERC-4337 smart account wallet CLI for AI agents.
+  On-chain 2FA, configurable spending limits, and macOS Keychain-backed vault.
+  Send ETH, ERC-20 tokens, and batch transactions via UserOperations on Ethereum,
+  Optimism, and Arbitrum. Account abstraction wallet with gas sponsorship,
+  counterfactual deployment, social recovery, and guardian management.
+  For token swaps, combine this skill with `defi/uniswap` for planning and `defi/elytro` for execution.
+  for programmatic consumption by agents and MCP integrations.
+version: 0.4.0
 homepage: https://elytro.com
-metadata: {"clawdbot":{"emoji":"💎","requires":{"bins":["elytro"],"node":">=24.0.0"},"install":[{"id":"npm","kind":"npm","package":"@elytro/cli","bins":["elytro"],"label":"Install Elytro CLI (npm)"}]}}
+metadata:
+  openclaw:
+    requires:
+      bins:
+        - elytro
+      node: ">=24.0.0"
+      # No env vars required on macOS — vault key is managed by Keychain.
+    emoji: "🔐"
+    homepage: https://github.com/Elytro-eth/skills
+    os: ["macos"]
+    install:
+      - id: npm
+        kind: npm
+        package: "@elytro/cli"
+        bins: ["elytro"]
+        label: "Install Elytro CLI (npm)"
 ---
 
-# Elytro Wallet
+# Elytro CLI — Agent Skill
 
-Ethereum EIP-4337 smart contract wallet for agents. Supports gasless transactions, 2FA security hooks, and email OTP.
+This skill teaches an autonomous agent how to operate the Elytro CLI end-to-end.
+Every command returns structured JSON so agents can plan multi-step workflows,
+parse output deterministically, and handle errors without human intervention.
 
 - Repo: https://github.com/Elytro-eth/Elytro
-- Install: `npm install -g @elytro/cli` (requires Node >=24)
+- Install: `npm install -g @elytro/cli` (requires Node >= 24)
 
-## RULES — Read before every action
+---
+
+## RULES — Read Before Every Action
 
 1. **Never guess on-chain data.** Always run the appropriate `elytro query` command to fetch balances, transaction status, token holdings, etc. Do NOT infer or assume values.
-2. **Always ask the user before confirming interactive prompts using Inline Buttons.** When any command outputs `(y/N)` or similar, STOP and present the user with **Telegram Inline Buttons** for confirmation (e.g., "Confirm", "Cancel" or "Approve", "Reject"). Example: `elytro tx send` shows "Sign and send this transaction? (y/N)" — pause and send an Inline Button message to the user with callback options instead of asking for text input. **ALL confirmations must use Inline Buttons, never text input.**
-3. **Use Inline Buttons for all list displays.** Whenever displaying lists (account list, token list, balance details, transaction history, etc.), render each item as a **clickable Inline Button** with callback_data pointing to that item's action. Example: for account selection, create buttons like `[{"text": "myWallet (0x...)", "callback_data": "account_select_myWallet"}]` instead of showing plain text and asking the user to type.
-4. **Chain IDs are hex or decimal.** Common values: Ethereum mainnet=`1`, Sepolia testnet=`0xaa36a7` (=11155111), Base=`8453`, Arbitrum=`42161`.
-5. **`value` in tx specs is always in ETH**, not wei.
-6. **Smart accounts must be deployed before sending transactions.** Check `elytro account info <account>` → "Deployed: Yes" before sending. If not deployed, run `elytro account activate <account>` first.
-7. **Use alias or address interchangeably** wherever `<account>` appears.
-8. **Inline Button Convention for Other Agents:** All agents reading this skill must adhere to the following callback_data naming scheme for consistency:
-   - Confirmations: `confirm_yes`, `confirm_no`, `confirm_cancel`
-   - Account selection: `account_select_<alias_or_address>`
-   - Token selection: `token_select_<tokenAddress>`
-   - Transaction approval: `tx_approve`, `tx_reject`, `tx_simulate`
-   - Action menu: `action_<action_name>` (e.g., `action_send`, `action_swap`, `action_balance_check`)
-   - This ensures all agents can parse and understand callbacks across the entire Elytro workflow ecosystem.
-
-9. **Default Menu on Ambiguous Intent.** When the user opens or mentions the wallet without a specific action (e.g., "打开钱包", "open wallet", "show elytro", "check my wallet"), do NOT ask what they want. Instead, **immediately display the Main Menu as Inline Buttons**. Each button leads to a sub-menu or action flow as defined in the Navigation Flow Map below.
+2. **Never auto-confirm interactive prompts.** When any command outputs `(y/N)` or similar, STOP and present the user with a confirmation choice. The agent must wait for explicit user approval before proceeding. Never pipe `y` into stdin.
+3. **Chain IDs accept hex or decimal.** Common values: Ethereum mainnet = `1`, Sepolia = `11155111` (`0xaa36a7`), OP Sepolia = `11155420`, Base = `8453`, Arbitrum = `42161`. Both formats work in `--chain`.
+4. **`value` in tx specs is always in ETH**, not wei. Example: `value:0.001` means 0.001 ETH.
+5. **`data` field must be valid hex.** Use `0x` for plain ETH transfers (no calldata). For contract calls, provide the full hex-encoded calldata with `0x` prefix and even length.
+6. **Smart accounts must be deployed before sending transactions.** Check `elytro account info <account>` → `"deployed": true` before sending. If not deployed, run `elytro account activate <account>` first.
+7. **Use alias or address interchangeably** wherever `<account>` appears. Both are accepted by all commands.
+8. **Always parse structured JSON output.** Every command returns `{ "success": true/false, ... }`. Parse stdout as JSON and check the `success` field. Never regex-match free-form text.
+9. **Security is non-negotiable.** Never send transactions from an account without `hookInstalled: true` and `emailVerified: true`. See the Security-First section below.
 
 ---
 
-## Navigation Flow Map (Inline Button UI)
+## Installation
 
-All navigation screens below **must** be rendered using Inline Buttons. When the user clicks a button, the agent proceeds to the corresponding sub-screen. Every sub-screen includes a "⬅️ Back" button to return to the parent menu.
+**Prerequisites**: Node.js >= 24.0.0
 
-### Level 0 — Main Menu (default entry point)
-
-Trigger: user says anything ambiguous like "open wallet", "打开钱包", "elytro", "我的钱包", etc.
-
-Agent must first run `elytro account list` silently in the background, then render:
-
-```json
-{
-  "text": "💎 Elytro Wallet\n\nWelcome! What would you like to do?",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "👛 My Accounts", "callback_data": "menu_accounts" },
-        { "text": "💰 Check Balance", "callback_data": "menu_balance" }
-      ],
-      [
-        { "text": "💸 Send", "callback_data": "menu_send" },
-        { "text": "🔄 Swap", "callback_data": "menu_swap" }
-      ],
-      [
-        { "text": "🔐 Security / 2FA", "callback_data": "menu_security" },
-        { "text": "⚙️ Settings", "callback_data": "menu_settings" }
-      ],
-      [
-        { "text": "➕ Create New Account", "callback_data": "action_create_account" }
-      ]
-    ]
-  }
-}
-```
-
-### Level 1 — Sub-menus
-
-**`menu_accounts`** → Run `elytro account list`, render each account as a button:
-```json
-{
-  "text": "👛 Your Accounts:",
-  "reply_markup": {
-    "inline_keyboard": [
-      [{ "text": "myWallet (0x1234...5678) - Sepolia ✅", "callback_data": "account_select_myWallet" }],
-      [{ "text": "tradingBot (0x8765...4321) - Base ⏳", "callback_data": "account_select_tradingBot" }],
-      [{ "text": "➕ Create New Account", "callback_data": "action_create_account" }],
-      [{ "text": "⬅️ Back", "callback_data": "menu_main" }]
-    ]
-  }
-}
-```
-- ✅ = deployed, ⏳ = not yet deployed
-- Upon `account_select_<alias>` callback → run `elytro account info <alias>` and display account detail with action buttons:
-```json
-{
-  "text": "👛 myWallet\n📍 Sepolia (0xaa36a7)\n🏷 0x1234...5678\n✅ Deployed\n💎 0.5 ETH",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "💸 Send", "callback_data": "action_send_from_myWallet" },
-        { "text": "💰 Tokens", "callback_data": "action_tokens_myWallet" }
-      ],
-      [
-        { "text": "🔄 Swap", "callback_data": "action_swap_from_myWallet" },
-        { "text": "🔐 Security", "callback_data": "menu_security" }
-      ],
-      [{ "text": "⬅️ Back", "callback_data": "menu_accounts" }]
-    ]
-  }
-}
-```
-
-**`menu_balance`** → If multiple accounts, show account selector first (same as `menu_accounts` but callback leads to balance view). If only one account, go straight to balance display with action buttons (as defined in the "Query" section below).
-
-**`menu_send`** → If multiple accounts, show account selector (callback: `action_send_from_<alias>`). Then prompt for recipient address and amount using the confirmation Inline Button flow (tx summary → Approve / Reject / Simulate).
-
-**`menu_swap`** → Kick off the Uniswap workflow (`defi/uniswap`). If multiple accounts, show account selector first, then gather tokens/amount before pinging the planner.
-
-**`menu_security`** → Run `elytro security status`, display:
-```json
-{
-  "text": "🔐 Security Status\n\n2FA: Installed ✅\nEmail OTP: user@example.com\nSpending Limit: $100/day",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "Install/Uninstall 2FA", "callback_data": "action_2fa_toggle" },
-        { "text": "Change Email", "callback_data": "action_email_change" }
-      ],
-      [
-        { "text": "Set Spending Limit", "callback_data": "action_spending_limit" }
-      ],
-      [{ "text": "⬅️ Back", "callback_data": "menu_main" }]
-    ]
-  }
-}
-```
-
-**`menu_settings`** → Run `elytro config show`, display:
-```json
-{
-  "text": "⚙️ Configuration\n\nAlchemy Key: ✅ Set\nPimlico Key: ❌ Not set\nActive Account: myWallet",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "Set Alchemy Key", "callback_data": "action_set_alchemy" },
-        { "text": "Set Pimlico Key", "callback_data": "action_set_pimlico" }
-      ],
-      [
-        { "text": "Switch Account", "callback_data": "menu_accounts" }
-      ],
-      [{ "text": "⬅️ Back", "callback_data": "menu_main" }]
-    ]
-  }
-}
-```
-
-**`menu_main`** → Return to Level 0 Main Menu.
-
-### Navigation Rules for Agents
-
-1. **Always show the Main Menu when user intent is ambiguous.** Do not ask "what do you want to do?" — show the menu.
-2. **Every sub-screen must include a "⬅️ Back" button** (callback_data: parent menu ID, e.g., `menu_main`, `menu_accounts`).
-3. **Fetching real data is mandatory before rendering.** Run the corresponding `elytro` CLI command to get live data (accounts, balances, security status, config), then render buttons with actual values. Never use placeholder data in production.
-4. **Multi-step flows** (e.g., Send ETH): guide the user through each step using successive Inline Button screens: account selection → recipient input → amount input → tx summary with Approve/Reject/Simulate.
-5. **Callback routing**: parse the callback_data prefix to determine the handler:
-   - `menu_*` → render the corresponding sub-menu
-   - `account_select_*` → fetch and show account details
-   - `token_select_*` → fetch and show token details
-   - `action_*` → execute the corresponding action or start an action flow
-   - `tx_*` → handle transaction lifecycle (approve, reject, simulate)
-   - `confirm_*` → handle generic yes/no/cancel prompts
-
----
-
-## Setup (first-time)
+### From npm (recommended)
 
 ```bash
-# 1. Initialize wallet (once per machine)
+npm install -g @elytro/cli
+```
+
+Or with other package managers:
+
+```bash
+pnpm add -g @elytro/cli
+yarn global add @elytro/cli
+bun add -g @elytro/cli
+```
+
+After installation, the `elytro` binary is available globally:
+
+```bash
+elytro --version
+elytro --help
+```
+
+### From source (monorepo)
+
+If working within the Elytro monorepo:
+
+```bash
+cd apps/cli
+pnpm install
+pnpm build          # builds with tsup → dist/index.js
+pnpm dev --help     # run without building (uses tsx)
+```
+
+For development, `pnpm dev <command>` runs directly from TypeScript source via tsx.
+For production, `pnpm build` compiles to `dist/` and the `elytro` bin is linked from there.
+
+---
+
+## Security-First: Non-Negotiable Setup Before Any Transaction
+
+**DO NOT send any transaction until the account has a SecurityHook installed with
+a verified email. An account without on-chain 2FA is an unprotected hot wallet —
+any compromise of the vault key means total, irreversible loss of funds.**
+
+The required sequence before any `tx send` is:
+
+```
+1. elytro init
+2. elytro account create --chain <id> --email <email> --daily-limit <usd>
+3. elytro security email bind <email>   ← user must provide OTP from inbox
+4. elytro account activate <alias>      ← deploys wallet + installs SecurityHook atomically
+```
+
+**Step 3 is interactive** — it requires a human to check their email and provide
+the 6-digit OTP code. The agent MUST pause and wait for this input. Do not skip it.
+
+Only after `activate` succeeds with `"hookInstalled": true` in the result is the
+account safe to use. If `hookInstalled` is `false`, stop and alert the user —
+the SecurityHook failed to install and the account is unprotected.
+
+**Why this matters**: The SecurityHook enforces on-chain 2FA (email OTP for
+high-value transactions) and daily spending limits. Without it, a single leaked
+private key can drain the entire account. With it, an attacker also needs access
+to the user's email — a fundamentally different threat model.
+
+---
+
+## Output Format (Universal)
+
+**Every command** outputs structured JSON to **stdout**:
+
+```json
+{ "success": true, "result": { ... } }
+{ "success": false, "error": { "code": -32000, "message": "...", "data": { ... } } }
+```
+
+Error codes follow JSON-RPC conventions:
+
+| Code     | Meaning                          |
+| -------- | -------------------------------- |
+| `-32000` | Internal / generic error         |
+| `-32001` | Resource not found               |
+| `-32002` | Account not ready / not deployed |
+| `-32003` | Sponsorship failed               |
+| `-32004` | UserOp build failed              |
+| `-32005` | Send failed                      |
+| `-32006` | Execution reverted on-chain      |
+| `-32007` | Hook authorization failed        |
+| `-32010` | Email not bound                  |
+| `-32011` | Safety delay not elapsed         |
+| `-32012` | OTP verification failed          |
+| `-32602` | Invalid parameters               |
+
+**Parsing rule**: Always `JSON.parse(stdout)` and check `result.success`.
+Spinners and interactive prompts go to **stderr** — never mix into stdout.
+
+---
+
+## Secret Management
+
+### Vault Key (macOS Keychain — zero configuration)
+
+The vault key is a 256-bit random key that decrypts the local keyring vault.
+
+On macOS, `elytro init` generates the vault key and stores it in the **system
+Keychain** automatically. Every subsequent CLI invocation loads it from Keychain
+with no env vars, no SecretRef, and no user interaction. This is the only
+officially supported platform.
+
+**The user never sees, copies, or configures the vault key.** It is fully managed
+by the OS.
+
+#### Security Properties
+
+- **Domain separation**: The encrypted vault (`keyring.json`) lives on disk; the
+  decryption key lives in Keychain. Copying `~/.elytro/` to another machine is
+  useless without the Keychain entry.
+- **OS-level protection**: Keychain is encrypted with the user's login password and
+  locked when the user is logged out or the machine is powered off.
+- **Zero-fill**: The raw key buffer is zeroed in memory after the keyring is unlocked.
+
+### Non-macOS Fallback (not recommended)
+
+> **Warning**: Running on Windows, Linux or in containers weakens the security model.
+> The vault key must be injected as an environment variable (`ELYTRO_VAULT_SECRET`),
+> which is exposed to `/proc/PID/environ`, inherited by child processes before
+> consume-once scrubbing, and lacks hardware-backed protection. Use at your own risk.
+> **Users must be fully briefed on these limitations.**
+> On-chain SecurityHook (2FA + spending limits) is strongly recommended as
+> compensating control.
+
+If you must run on Non-macOS:
+
+1. `elytro init` returns `vaultSecret` in the JSON result.
+2. The agent captures this value and stores it in SecretRef.
+3. On subsequent runs, OpenClaw injects it as an env var. The CLI reads it once
+   and immediately deletes it from `process.env` (consume-once).
+
+```jsonc
+// openclaw.json — only needed on non-macOS
+{
+  "skills": {
+    "entries": {
+      "elytro-cli": {
+        "env": {
+          "ELYTRO_VAULT_SECRET": {
+            "source": "env",
+            "provider": "default",
+            "id": "ELYTRO_VAULT_SECRET",
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+### Optional API Keys
+
+These improve reliability but are not required for basic operation:
+
+| Variable             | Purpose                          | Injected Via                                     |
+| -------------------- | -------------------------------- | ------------------------------------------------ |
+| `ELYTRO_ALCHEMY_KEY` | Alchemy RPC (higher rate limits) | `elytro config set alchemy-key <KEY>` or env var |
+| `ELYTRO_PIMLICO_KEY` | Pimlico bundler/paymaster        | `elytro config set pimlico-key <KEY>` or env var |
+
+These can be persisted once via `config set` and don't need re-injection.
+
+---
+
+## First-Time Setup
+
+An agent running against a fresh `~/.elytro/` must execute this sequence exactly once.
+**Every step is mandatory. Do not skip or reorder.**
+
+```bash
+# Step 1: Initialize wallet
+# Vault key is auto-stored in macOS Keychain. No secrets to manage.
 elytro init
 
-# 2. Create a smart account on a chain
-elytro account create --chain <chainId> --alias <alias>
-# Example: elytro account create --chain 0xaa36a7 --alias myWallet
+# Step 2: Create a smart account WITH security enabled
+# --email and --daily-limit are NOT optional in practice.
+# Omitting them creates an unprotected account — DO NOT DO THIS.
+elytro account create --chain 11155420 --alias agent-primary \
+  --email user@example.com --daily-limit 100
 
-# 3. Deploy the smart contract on-chain (gasless by default)
-elytro account activate <alias-or-address>
+# Step 3: Bind and verify email (INTERACTIVE — requires human OTP input)
+# The user must check their inbox and provide the 6-digit code.
+# DO NOT proceed until this succeeds.
+elytro security email bind user@example.com
+
+# Step 4: Activate (deploy + install SecurityHook atomically)
+# Check result: "hookInstalled" MUST be true. If false, STOP.
+elytro account activate agent-primary
+
+# Step 5: (Optional) Set API keys for better reliability
+elytro config set alchemy-key "$ELYTRO_ALCHEMY_KEY"
+elytro config set pimlico-key "$ELYTRO_PIMLICO_KEY"
 ```
+
+### Pre-Transaction Safety Checklist
+
+Before executing any `tx send`, the agent MUST verify:
+
+1. `account info` shows `"deployed": true`
+2. `account info` shows `"securityStatus": { "hookInstalled": true }`
+3. `security status` shows `"hookInstalled": true` and `"profile.emailVerified": true`
+4. Account has sufficient balance (sponsor covers gas only, NOT value)
+
+If any check fails, **do not send the transaction**. Alert the user and guide them
+through the missing step.
 
 ---
 
-## Account Management
+## Command Reference
+
+### `elytro init`
 
 ```bash
-elytro account list                        # List all accounts
-elytro account list --chain <chainId>      # Filter by chain
-elytro account info <account>              # On-chain details (balance, deployed status, etc.)
-elytro account switch <account>            # Set active account
+elytro init
 ```
 
-**Inline Button Display for Account List:**
-After running `elytro account list`, render results as Inline Buttons instead of plain text. Example:
+Generates a 256-bit vault key and an EOA signing key.
+
+**Success result:**
 
 ```json
 {
-  "text": "Select an account to manage:",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "myWallet (0x1234...5678) - Sepolia", "callback_data": "account_select_myWallet" },
-        { "text": "tradingBot (0x8765...4321) - Base", "callback_data": "account_select_tradingBot" }
-      ],
-      [
-        { "text": "➕ Create New Account", "callback_data": "action_create_account" }
-      ]
-    ]
+  "status": "initialized",
+  "dataDir": "~/.elytro",
+  "secretProvider": "KeychainProvider",
+  "nextStep": "Run `elytro account create --chain <chainId>` ..."
+}
+```
+
+On non-macOS, result also includes `vaultSecret` (base64) — save it immediately.
+
+If already initialized: `{ "status": "already_initialized", "dataDir": "..." }`.
+
+---
+
+### Account Commands
+
+#### `elytro account create`
+
+```bash
+elytro account create -c <chainId> [-a <name>] [-e <email>] [-l <usd>]
+```
+
+- `-c, --chain` (required): Numeric chain ID (hex or decimal).
+- `-a, --alias` (optional): Human-readable name. Auto-generated if omitted (e.g. `swift-panda`).
+- `-e, --email` (**required in practice**): Email for 2FA OTP. Stored as security intent.
+- `-l, --daily-limit` (**required in practice**): Daily spending limit in USD.
+
+**Supported chains**: 1 (Ethereum), 10 (Optimism), 42161 (Arbitrum), 11155111 (Sepolia), 11155420 (OP Sepolia).
+
+> **Rule: ALWAYS pass `--email` and `--daily-limit`.** The flags are technically
+> optional to allow edge-case testing, but in any real workflow, creating an account
+> without them produces an unprotected wallet. If the user has not provided an email
+> or spending limit, the agent should ask for them before proceeding.
+
+**Success result:**
+
+```json
+{
+  "alias": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "chainId": 11155420,
+  "deployed": false,
+  "security": {
+    "email": "user@example.com",
+    "emailBindingStarted": false,
+    "dailyLimitUsd": 100,
+    "hookPending": true
   }
 }
 ```
 
-Upon callback (e.g., `account_select_myWallet`), fetch account details via `elytro account info` and present next actions (send, check balance, swap, etc.) also as Inline Buttons.
+When `--email`/`--daily-limit` are provided, a **security intent** is stored locally.
+The SecurityHook is installed atomically during `activate`. Intent is temporary
+and deleted after activation completes — it exists only to bridge create → activate.
+
+**If `"security": null` in the result**, the account has no security configuration.
+The agent should warn the user and suggest re-creating with `--email` and `--daily-limit`.
+
+#### `elytro account activate`
+
+```bash
+elytro account activate [alias|address] [--no-sponsor]
+```
+
+Deploys the smart contract wallet on-chain. If a security intent exists (from
+`--email`/`--daily-limit` at create), batches SecurityHook installation into the
+same deploy UserOp. Atomic — if hook install fails, the entire deployment reverts.
+
+**Success result:**
+
+```json
+{
+  "alias": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "chainId": 11155420,
+  "transactionHash": "0x...",
+  "gasCost": "0.0001 ETH",
+  "sponsored": true,
+  "hookInstalled": true,
+  "explorer": "https://sepolia-optimism.etherscan.io/tx/0x..."
+}
+```
+
+**Critical: Check `hookInstalled` in the result.**
+
+- `true` → SecurityHook is active. Safe to proceed with transactions.
+- `false` → Hook installation failed. **DO NOT send transactions.** The account
+  is deployed but unprotected. Run `elytro security 2fa install` manually, or
+  alert the user.
+
+If already deployed: `{ "status": "already_deployed" }`.
+
+**Important**: Fund the CREATE2 address _before_ activation if sponsorship might fail.
+
+#### `elytro account list`
+
+```bash
+elytro account list [alias|address] [-c <chainId>]
+```
+
+**Success result:**
+
+```json
+{
+  "accounts": [
+    {
+      "active": true,
+      "alias": "swift-panda",
+      "address": "0x...",
+      "chain": "OP Sepolia",
+      "chainId": 11155420,
+      "deployed": true,
+      "recovery": false
+    }
+  ],
+  "total": 1
+}
+```
+
+#### `elytro account info`
+
+```bash
+elytro account info [alias|address]
+```
+
+Fetches live on-chain data (balance, deployment status). Requires RPC access.
+
+**Success result:**
+
+```json
+{
+  "alias": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "chainId": 11155420,
+  "deployed": true,
+  "balance": "0.05 ETH",
+  "recovery": false,
+  "securityStatus": { "hookInstalled": true },
+  "explorer": "https://..."
+}
+```
+
+If security is pending (pre-activate): includes `securityIntent` instead of `securityStatus`.
+
+**Use this command to verify security status before transactions.** If `securityStatus`
+is absent or `hookInstalled` is false, the account is unprotected.
+
+#### `elytro account switch`
+
+```bash
+elytro account switch <alias|address>
+```
+
+**Always pass alias or address** — without arguments it shows an interactive
+selector (not suitable for agents).
+
+**Success result:**
+
+```json
+{
+  "alias": "cold-storage",
+  "address": "0x...",
+  "chain": "Sepolia",
+  "chainId": 11155111,
+  "deployed": true,
+  "balance": "0.1 ETH"
+}
+```
+
+After switching, SDK and wallet client re-initialize to the new account's chain.
 
 ---
 
-## Query (read-only, no confirmation needed)
+### Transaction Commands
+
+All transaction commands use the unified `--tx` flag:
+
+```
+--tx "to:0xAddress,value:0.1,data:0xAbcDef"
+```
+
+**Rules**:
+
+- `to` is always required (valid Ethereum address).
+- At least one of `value` or `data` must be present.
+- `value` is in ETH (e.g. `"0.001"`), not wei.
+- `data` is hex-encoded calldata (`0x` prefix, even length). Use `data:0x` for plain ETH transfers.
+- Multiple `--tx` flags → batch (`executeBatch`). Order preserved.
+
+> **Pre-flight requirement**: Before any `tx send`, verify the account has
+> `securityStatus.hookInstalled === true` via `account info` or `security status`.
+> Sending from an unprotected account risks total fund loss if the key is compromised.
+
+#### `elytro tx send`
 
 ```bash
-# ETH balance — ALWAYS run this; never guess the balance
-elytro query balance <account>
+elytro tx send [account] --tx <spec> [--no-sponsor] [--no-hook] [--userop <json>]
+```
 
-# ERC-20 token balance
-elytro query balance --token <tokenAddress> <account>
+```bash
+# ETH transfer
+elytro tx send --tx "to:0xRecipient,value:0.001"
 
-# All ERC-20 holdings
-elytro query tokens <account>
+# Contract call
+elytro tx send --tx "to:0xContract,data:0xa9059cbb..."
 
-# Transaction status by hash
+# Batch (multiple --tx flags, order preserved)
+elytro tx send --tx "to:0xA,value:0.1" --tx "to:0xB,data:0xab"
+
+# From specific account
+elytro tx send my-alias --tx "to:0xAddr,value:0.01"
+
+# Skip sponsorship / Skip 2FA hook
+elytro tx send --tx "to:0xAddr,value:0.01" --no-sponsor
+elytro tx send --tx "to:0xAddr,value:0.01" --no-hook
+
+# Send pre-built UserOp (skips build step)
+elytro tx send --userop '{"sender":"0x...",...}'
+```
+
+**Pipeline**: resolve account → balance pre-check → build UserOp → fee data →
+estimate gas (fakeBalance) → sponsor → confirm → sign → send → wait for receipt.
+
+**Success result:**
+
+```json
+{
+  "status": "confirmed",
+  "account": "swift-panda",
+  "address": "0x...",
+  "transactionHash": "0x...",
+  "block": "12345",
+  "gasCost": "0.0001 ETH",
+  "sponsored": true,
+  "explorer": "https://..."
+}
+```
+
+Cancelled by user: `{ "status": "cancelled" }`.
+
+**Critical**: Sponsor covers gas only, **not** the transaction value. If sending
+0.1 ETH, the account must hold >= 0.1 ETH regardless of sponsorship.
+
+**Exit codes**: 0 = success, 1 = error or execution reverted.
+
+#### `elytro tx build`
+
+```bash
+elytro tx build [account] --tx "to:0xAddr,value:0.1" [--no-sponsor]
+```
+
+Same pipeline as `send` but stops before signing. Returns the full unsigned UserOp.
+
+**Success result:**
+
+```json
+{
+  "userOp": { "sender": "0x...", "callData": "0x...", "...": "..." },
+  "account": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "chainId": 11155420,
+  "txType": "ETH Transfer",
+  "sponsored": true
+}
+```
+
+#### `elytro tx simulate`
+
+```bash
+elytro tx simulate [account] --tx "to:0xAddr,value:0.1" [--no-sponsor]
+```
+
+Dry-run with gas breakdown, balance check, and warnings.
+
+**Success result:**
+
+```json
+{
+  "txType": "ETH Transfer",
+  "account": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "chainId": 11155420,
+  "transactions": [{ "to": "0x...", "value": "0.1" }],
+  "gas": {
+    "callGasLimit": "21000",
+    "verificationGasLimit": "100000",
+    "preVerificationGas": "50000",
+    "maxFeePerGas": "1000000000",
+    "maxPriorityFeePerGas": "100000000",
+    "maxCost": "0.00017 ETH"
+  },
+  "sponsored": true,
+  "balance": "0.5 ETH",
+  "warnings": ["Insufficient balance for value: need 1.0, have 0.5 ETH"]
+}
+```
+
+The `warnings` array is only present when issues are detected.
+
+---
+
+### Query Commands
+
+All query commands are read-only and do not require confirmation.
+
+#### `elytro query balance`
+
+```bash
+elytro query balance [alias|address]                 # ETH balance
+elytro query balance [alias|address] --token 0xAddr  # ERC-20 balance
+```
+
+**Success result (ETH):**
+
+```json
+{
+  "account": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "symbol": "ETH",
+  "balance": "0.05"
+}
+```
+
+**Success result (ERC-20):**
+
+```json
+{
+  "account": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "token": "0x...",
+  "symbol": "USDC",
+  "decimals": 6,
+  "balance": "1000.0"
+}
+```
+
+#### `elytro query tokens`
+
+```bash
+elytro query tokens [alias|address]
+```
+
+Lists all ERC-20 tokens with non-zero balances. Uses Alchemy — requires Alchemy key.
+
+**Success result:**
+
+```json
+{
+  "account": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "tokens": [
+    { "address": "0x...", "symbol": "USDC", "decimals": 6, "balance": "1000.0" }
+  ],
+  "total": 1
+}
+```
+
+#### `elytro query tx`
+
+```bash
 elytro query tx <hash>
+```
 
-# Current chain info
+**Success result:**
+
+```json
+{
+  "hash": "0x...",
+  "status": "success",
+  "block": "12345",
+  "from": "0x...",
+  "to": "0x...",
+  "gasUsed": "21000",
+  "chain": "OP Sepolia"
+}
+```
+
+#### `elytro query chain`
+
+```bash
 elytro query chain
 ```
 
-**Inline Button Display for Balance & Token Lists:**
+**Success result:**
 
-When displaying balances or token holdings, format as Inline Buttons for quick action:
-
-Example balance display with action buttons:
 ```json
 {
-  "text": "💰 Account: myWallet\n\n💎 ETH: 0.5 ETH (~$1,200)\n🪙 USDC: 2,000 USDC\n🌈 DAI: 1,500 DAI",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "💸 Send ETH", "callback_data": "action_send_eth" },
-        { "text": "🔄 Swap", "callback_data": "action_swap" }
-      ],
-      [
-        { "text": "🪙 Select Token", "callback_data": "action_select_token" },
-        { "text": "📊 History", "callback_data": "action_history" }
-      ],
-      [
-        { "text": "🔐 Security", "callback_data": "action_security" }
-      ]
-    ]
-  }
+  "chainId": 11155420,
+  "name": "OP Sepolia",
+  "nativeCurrency": "ETH",
+  "rpcEndpoint": "https://opt-sepolia.g.alchemy.com/v2/***",
+  "bundler": "https://api.pimlico.io/v2/.../rpc?apikey=***",
+  "blockExplorer": "https://sepolia-optimism.etherscan.io",
+  "blockNumber": "12345678",
+  "gasPrice": "1000000 wei (0.000021 ETH per basic tx)"
 }
 ```
 
-Token selection example:
+API keys are always masked in output.
+
+#### `elytro query address`
+
+```bash
+elytro query address <0xAddress>
+```
+
+**Success result:**
+
 ```json
 {
-  "text": "Select a token to view or manage:",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "ETH (0.5)", "callback_data": "token_select_ETH" },
-        { "text": "USDC (2000)", "callback_data": "token_select_0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" }
-      ],
-      [
-        { "text": "DAI (1500)", "callback_data": "token_select_0x6B175474E89094C44Da98b954EedeAC495271d0F" }
-      ]
-    ]
-  }
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "type": "contract",
+  "balance": "1.5 ETH",
+  "codeSize": "4096 bytes"
 }
 ```
+
+`codeSize` is only present for contract addresses.
 
 ---
 
-## Multi-Step Action Flows
+### Security Commands (2FA)
 
-### Send ETH / Token Flow (Inline Button Driven)
+All security commands require the account to be **deployed**. All output structured JSON.
 
-**Step 1: Account Selection** (if multiple accounts exist)
-- Render `menu_accounts` buttons.
-- Upon `account_select_<alias>` callback, proceed to Step 2.
+> **Reminder**: These commands are for managing security _after_ the account is
+> deployed. For new accounts, the recommended path is `--email` + `--daily-limit`
+> at `account create` time, which installs the hook atomically during `activate`.
+> Use these commands to manage an existing hook or to install one retroactively.
 
-**Step 2: Recipient Input**
-- Send a message to the user requesting recipient address.
-- User replies with address.
-- Agent validates the address and proceeds to Step 3.
+#### `elytro security status`
 
-**Step 3: Amount Input**
-- Send a message requesting the amount to send.
-- User replies with amount.
-- Agent validates the amount against account balance and proceeds to Step 4.
+```bash
+elytro security status
+```
 
-**Step 4: Transaction Summary & Approval**
-- Render the tx summary as Inline Buttons (Approve, Reject, Simulate):
+**Use this to verify the account is protected before sending transactions.**
+
+**Success result:**
+
 ```json
 {
-  "text": "📋 Transaction Summary\n\n💰 Account: myWallet\n📤 To: 0xabcd...ef01\n💵 Amount: 0.1 ETH\n⛽ Gas: ~0.001 ETH (sponsored)\n\nProceed?",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "✅ Approve", "callback_data": "tx_approve" },
-        { "text": "❌ Reject", "callback_data": "tx_reject" }
-      ],
-      [
-        { "text": "🔍 Simulate First", "callback_data": "tx_simulate" }
-      ],
-      [
-        { "text": "⬅️ Back", "callback_data": "menu_send" }
-      ]
-    ]
+  "account": "swift-panda",
+  "address": "0x...",
+  "chain": "OP Sepolia",
+  "chainId": 11155420,
+  "hookInstalled": true,
+  "hookAddress": "0x...",
+  "capabilities": {
+    "preUserOpValidation": true,
+    "preIsValidSignature": true
+  },
+  "profile": {
+    "email": "u***@example.com",
+    "emailVerified": true,
+    "dailyLimitUsd": "100.00"
   }
 }
 ```
 
-**Step 5: Execution**
-- Upon `tx_approve` callback, run `elytro tx send` and report result.
-- Upon `tx_reject` callback, abort and return to Main Menu.
-- Upon `tx_simulate` callback, run `elytro tx simulate`, show gas estimate and paymaster availability, then re-display approval buttons.
+**What to check:**
 
-### Swap Flow (Inline Button Driven)
+- `hookInstalled` must be `true`
+- `profile.emailVerified` must be `true`
+- If either is `false`, the account is not fully protected
 
-**Step 1: Account Selection** (if multiple accounts exist)
-- Render `menu_accounts` buttons.
-- Upon `account_select_<alias>` callback, proceed to Step 2.
+#### `elytro security 2fa install`
 
-**Step 2: Token Pair Selection**
-- Render token list as Inline Buttons for "From" token.
-- Upon `token_select_<fromToken>` callback, render list for "To" token.
-- Upon second `token_select_<toToken>` callback, proceed to Step 3.
+```bash
+elytro security 2fa install [--capability <1|2|3>]
+```
 
-**Step 3: Amount Input**
-- Request swap amount from user (text input).
-- User replies with amount.
-- Proceed to Step 4.
+Capability flags: 1=SIGNATURE_ONLY, 2=USER_OP_ONLY, 3=BOTH (default: 3).
 
-**Step 4: Planner Request (`defi/uniswap`)**
-- Invoke the `defi/uniswap` skill with account alias, chain, from/to tokens, and amount.
-- The planner returns a summary plus calldata or a UserOp that Elytro can execute.
-- Display the preview (values pulled from the planner output) before asking for approval:
+Only needed if `activate` was run without a security intent (i.e., the account was
+created without `--email`/`--daily-limit`). For new accounts, prefer the atomic
+create → activate flow instead.
+
+**Success result:**
+
 ```json
 {
-  "text": "🔄 Swap Preview\n\n💵 From: 0.5 ETH\n💎 To: ~1,200 USDC\n📊 Price: 1 ETH = 2400 USDC\n⛽ Gas: ~0.001 ETH (sponsored)\n\nReady to swap?",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "✅ Confirm Swap", "callback_data": "tx_approve" },
-        { "text": "❌ Cancel", "callback_data": "tx_reject" }
-      ],
-      [
-        { "text": "⬅️ Adjust Amount", "callback_data": "menu_swap" }
-      ]
-    ]
-  }
+  "status": "installed",
+  "account": "swift-panda",
+  "address": "0x...",
+  "hookAddress": "0x...",
+  "capability": "BOTH (UserOp + Signature)",
+  "safetyDelay": 172800
 }
 ```
 
-**Step 5: Execution (`defi/elytro`)**
-- Upon `tx_approve` callback, feed the planner output into the `defi/elytro` workflow: run `elytro tx simulate` first, then `elytro tx send` if the simulation passes.
-- Upon `tx_reject`, abort and surface the Main Menu.
-- Upon `tx_simulate`, rerun `elytro tx simulate`, show gas/sponsorship, then re-display approval buttons.
+If already installed: `{ "status": "already_installed" }`.
+
+**After installing the hook, you MUST also bind an email** (`security email bind`)
+for the 2FA to be functional. The hook alone without a verified email provides
+no OTP protection.
+
+#### `elytro security 2fa uninstall`
+
+```bash
+elytro security 2fa uninstall                   # Normal (requires hook signature)
+elytro security 2fa uninstall --force            # Start force-uninstall countdown
+elytro security 2fa uninstall --force --execute  # Execute after safety delay
+```
+
+**Normal uninstall result:** `{ "status": "uninstalled" }`
+**Force start result:** `{ "status": "force_uninstall_started", "safetyDelay": 172800 }`
+**Force execute result:** `{ "status": "force_uninstalled" }`
+**Already started:** `{ "status": "already_initiated", "canExecute": false, "availableAfter": "..." }`
+
+#### `elytro security email bind`
+
+```bash
+elytro security email bind <email>
+```
+
+**This is the critical step that makes 2FA functional.** Requires interactive OTP
+input — the user must check their email and provide the 6-digit code. The agent
+MUST wait for this input and cannot skip it.
+
+**Success result:**
+
+```json
+{
+  "status": "email_bound",
+  "email": "u***@example.com",
+  "emailVerified": true
+}
+```
+
+#### `elytro security email change`
+
+```bash
+elytro security email change <email>
+```
+
+**Success result:** `{ "status": "email_changed", "email": "..." }`
+
+#### `elytro security spending-limit`
+
+```bash
+elytro security spending-limit          # View current
+elytro security spending-limit 100      # Set to $100/day (requires OTP)
+```
+
+**View result:** `{ "dailyLimitUsd": "100.00", "email": "u***@example.com" }`
+**Set result:** `{ "status": "daily_limit_set", "dailyLimitUsd": "100.00" }`
 
 ---
 
-## Transactions
+### Configuration Commands
 
-### Send (requires user confirmation)
-
-```bash
-# ⚠ STOP before confirming — ask the user first!
-elytro tx send --tx "to:<address>,value:<ethAmount>,data:<hex>"
-
-# Multiple calls in one UserOp (batched)
-elytro tx send --tx "to:0xA,value:0.1,data:0x" --tx "to:0xB,value:0,data:0xcafe"
-
-# Skip sponsorship (user pays gas)
-elytro tx send --no-sponsor --tx "to:<address>,value:<ethAmount>,data:0x"
-
-# Skip 2FA hook check
-elytro tx send --no-hook --tx "to:<address>,value:<ethAmount>,data:0x"
-
-# Send a pre-built UserOp
-elytro tx send --userop '<userOpJson>'
-```
-
-### Simulate (safe, no confirmation)
+#### `elytro config show`
 
 ```bash
-# Preview gas estimate and sponsor check without sending
-elytro tx simulate --tx "to:<address>,value:<ethAmount>,data:<hex>"
+elytro config show
 ```
 
-### Build unsigned UserOp (no send)
+**Success result:**
+
+```json
+{
+  "rpcProvider": "Alchemy (user-configured)",
+  "bundlerProvider": "Pimlico (user-configured)",
+  "alchemyKey": "abc1***xyz9",
+  "currentChain": "OP Sepolia",
+  "chainId": 11155420,
+  "rpcEndpoint": "https://opt-sepolia.g.alchemy.com/v2/***",
+  "bundler": "https://api.pimlico.io/v2/.../rpc?apikey=***"
+}
+```
+
+#### `elytro config set`
 
 ```bash
-elytro tx build --tx "to:<address>,value:<ethAmount>,data:<hex>" <account>
+elytro config set alchemy-key <KEY>
+elytro config set pimlico-key <KEY>
 ```
+
+**Success result:** `{ "key": "alchemy-key", "status": "saved", "rpcEndpoint": "...", "bundler": "..." }`
+
+#### `elytro config remove`
+
+```bash
+elytro config remove alchemy-key
+```
+
+**Success result:** `{ "key": "alchemy-key", "status": "removed" }`
 
 ---
 
-## Token Swaps (Uniswap planner + Elytro execution)
+## Token Swaps (Uniswap Planner + Elytro Execution)
 
-Elytro still relies on Uniswap AI for routing logic, but swaps are executed through the Elytro CLI. Combine two skills:
+Elytro relies on Uniswap AI for routing logic, but swaps are executed through the
+Elytro CLI. Combine two skills:
 
-- `defi/uniswap` – collects intent and returns calldata/UserOps plus a price/route summary.
-- `defi/elytro` – simulates and sends the planner artifact from your Elytro account.
+- `defi/uniswap` — collects intent and returns calldata/UserOps plus a price/route summary.
+- `defi/elytro` — simulates and sends the planner artifact from your Elytro account.
 
 ### Workflow
 
-1. **Load `defi/uniswap`** – give it the Elytro account alias/address, chain, tokens, and amount. Ask for either `{chainId, target, calldata, valueEth}` or `{userOperation}` output plus a human-readable summary.
-2. **Validate the response** – confirm router/contract addresses are legitimate, the chain ID matches the user request, and slippage/deadlines align with requirements.
-3. **Preview for the user** – render the summary (amount in/out, route, gas sponsorship) with Inline Buttons (`tx_approve`, `tx_reject`, `tx_simulate`).
-4. **Execute through `defi/elytro`** – on approval, run `elytro tx simulate <alias> ...` followed by `elytro tx send ...` using the planner’s calldata/UserOp.
-5. **Report results** – share bundler hash / transaction hash plus refreshed balances (`elytro query balance ...`) back to the user.
+1. **Load `defi/uniswap`** — give it the Elytro account alias/address, chain, tokens, and amount. Ask for either `{chainId, target, calldata, valueEth}` or `{userOperation}` output plus a human-readable summary.
+2. **Validate the response** — confirm router/contract addresses are legitimate, the chain ID matches the user request, and slippage/deadlines align with requirements.
+3. **Preview for the user** — render the summary (amount in/out, route, gas sponsorship) and ask for explicit approval before proceeding.
+4. **Execute through `defi/elytro`** — on approval, run `elytro tx simulate` first, then `elytro tx send` using the planner's calldata/UserOp.
+5. **Report results** — share bundler hash / transaction hash plus refreshed balances (`elytro query balance`) back to the user.
 
-### Rules for swaps
+### Rules for Swaps
 
 - **Never guess swap outputs.** Always surface the exact minimums, routes, and slippage from `defi/uniswap`.
 - **Verify contract addresses** before simulating or sending.
-- **Document sponsorship** – note whether `elytro tx simulate` reports `Sponsored: Yes/No` so the user knows who pays gas.
+- **Document sponsorship** — note whether `elytro tx simulate` reports `"sponsored": true/false` so the user knows who pays gas.
 - **Stay in one flow.** Do not open external swap links; all execution happens in Elytro once the planner provides calldata/UserOps.
 
 ### Example
@@ -439,112 +917,125 @@ VALUE_ETH=0
 
 # Simulate then execute (defi/elytro instructions)
 elytro tx simulate demo-arb \
-  --chain "$CHAIN" \
   --tx "to:$ROUTER,value:$VALUE_ETH,data:$CALLDATA"
 elytro tx send demo-arb \
-  --chain "$CHAIN" \
   --tx "to:$ROUTER,value:$VALUE_ETH,data:$CALLDATA"
 ```
 
 ---
 
-## Security / 2FA
+## Security Intent / Status Model
 
-```bash
-# View current security status
-elytro security status
+Security configuration follows a two-phase model:
 
-# Install SecurityHook (2FA)
-elytro security 2fa install --capability 2     # 1=SIGNATURE_ONLY, 2=USER_OP_ONLY, 3=BOTH
+1. **SecurityIntent** (temporary) — Created at `account create` time when `--email`
+   and/or `--daily-limit` are provided. Stored per account + per chain. Exists only
+   to bridge the gap between create and activate.
 
-# Uninstall SecurityHook
-elytro security 2fa uninstall
-elytro security 2fa uninstall --force          # Start force-uninstall countdown
-elytro security 2fa uninstall --execute        # Execute after safety delay
+2. **SecurityStatus** (persistent) — Written by `activate` after SecurityHook is
+   successfully installed on-chain. Intent is deleted at this point.
 
-# Email OTP
-elytro security email bind <email>             # Bind email for OTP delivery
-elytro security email change <email>           # Change bound email
-
-# Spending limit (USD/day)
-elytro security spending-limit                 # View current limit
-elytro security spending-limit 100             # Set to $100/day
-```
+**Rule**: Intent exists = not yet executed. Intent absent = consumed or never configured.
+This prevents double-installation and makes state inspection trivial.
 
 ---
 
-## Configuration
+## Agent Workflow Patterns
+
+### Pattern 1: Fresh Setup + Send ETH (Security-First)
 
 ```bash
-elytro config show                             # Show current endpoint config
-elytro config set alchemy-key <apiKey>         # Set Alchemy API key
-elytro config set pimlico-key <apiKey>         # Set Pimlico API key
-elytro config remove alchemy-key               # Remove key, revert to public endpoint
-elytro config remove pimlico-key
-```
-
----
-
-## Common Workflows
-
-### Check ETH balance
-```bash
-elytro query balance <account>
-# Returns JSON: { "result": { "balance": "0.01", "symbol": "ETH", ... } }
-```
-
-### Send ETH to an address
-```bash
-# Step 1: Simulate first (optional but recommended)
-elytro tx simulate --tx "to:<toAddress>,value:<amount>,data:0x"
-
-# Step 2: Send — PAUSE at confirmation prompt, ask user before proceeding
-elytro tx send --tx "to:<toAddress>,value:<amount>,data:0x"
-```
-
-### First-time full setup on Sepolia
-```bash
+# Initialize
 elytro init
-elytro account create --chain 0xaa36a7 --alias myWallet
-elytro account activate myWallet
-elytro account info myWallet    # Verify Deployed: Yes
+
+# Create with security — ALWAYS include --email and --daily-limit
+elytro account create --chain 11155420 --alias agent-primary \
+  --email user@example.com --daily-limit 100
+
+# Bind email — INTERACTIVE, requires human OTP input
+elytro security email bind user@example.com
+# → agent pauses, user enters 6-digit OTP from inbox
+
+# Fund address via faucet or external transfer (before activate)
+
+# Activate — deploys + installs SecurityHook atomically
+RESULT=$(elytro account activate agent-primary)
+# → VERIFY: result.hookInstalled === true. If false, STOP.
+
+# Now safe to transact
+elytro tx send --tx "to:0xRecipient,value:0.001"
 ```
 
----
+### Pattern 2: Pre-Transaction Safety Check
 
-## Confirmation Prompt Protocol (Inline Button Version)
+```bash
+# Before every transaction session, verify security is active
+STATUS=$(elytro security status)
+# → Check: hookInstalled === true AND profile.emailVerified === true
+# → If not, guide user through security email bind
 
-Some commands are **interactive** and will pause for user input. **All confirmations MUST use Telegram Inline Buttons, never plain text prompts.**
+BALANCE=$(elytro query balance agent-primary)
+# → parse JSON: result.balance
+# → verify sufficient funds (sponsor covers gas, NOT value)
 
-| Command | Prompt | Action |
-|---------|--------|--------|
-| `tx send` | `Sign and send this transaction? (y/N)` | **Send Inline Buttons:** `Approve` (callback_data: `tx_approve`), `Reject` (callback_data: `tx_reject`), `Simulate First` (callback_data: `tx_simulate`) |
-| `account activate` | activation confirmation | **Send Inline Buttons:** `Activate Now` (callback_data: `confirm_yes`), `Cancel` (callback_data: `confirm_cancel`) |
-| `security 2fa uninstall` | uninstall confirmation | **Send Inline Buttons:** `Uninstall 2FA` (callback_data: `confirm_yes`), `Keep 2FA` (callback_data: `confirm_no`) |
-
-**Inline Button Template for Confirmations:**
-
-```json
-{
-  "text": "Transaction Summary:\n• To: 0x1234...5678\n• Amount: 0.5 ETH\n• Gas: ~0.001 ETH (sponsorship available)\n\nDo you approve this transaction?",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        { "text": "✅ Approve", "callback_data": "tx_approve" },
-        { "text": "❌ Reject", "callback_data": "tx_reject" }
-      ],
-      [
-        { "text": "🔍 Simulate First", "callback_data": "tx_simulate" }
-      ]
-    ]
-  }
-}
+elytro tx send --tx "to:0xRecipient,value:0.001"
 ```
 
-**Rules:**
-1. **Never auto-confirm.** Always surface the transaction summary and wait for explicit Inline Button approval.
-2. **Callback handling:** Upon receiving a callback (e.g., `tx_approve`), execute the corresponding action and report the result via another message (or update the existing message with the result).
-3. **Audit logging:** Log every confirmation decision (approve/reject/simulate) with timestamp, callback_data, and user ID for compliance and troubleshooting.
+### Pattern 3: Batch Multiple Operations
+
+```bash
+elytro tx send \
+  --tx "to:0xAlice,value:0.01" \
+  --tx "to:0xBob,value:0.02" \
+  --tx "to:0xContract,data:0xa9059cbb..."
+```
+
+All packed into one UserOp (`executeBatch`), executed atomically.
+
+### Pattern 4: Simulate → Send
+
+```bash
+SIM=$(elytro tx simulate --tx "to:0xAddr,value:0.5")
+# → parse result.warnings array (empty = safe to proceed)
+# → check result.gas.maxCost, result.sponsored
+elytro tx send --tx "to:0xAddr,value:0.5"
+```
+
+### Pattern 5: Multi-Account Management
+
+```bash
+elytro account create --chain 11155420 --alias hot-wallet \
+  --email user@example.com --daily-limit 50
+elytro account create --chain 11155420 --alias cold-storage \
+  --email user@example.com --daily-limit 500
+# → bind email + activate BOTH accounts before transacting
+
+elytro account switch hot-wallet
+elytro tx send --tx "to:0xAddr,value:0.01"
+elytro account switch cold-storage
+elytro query balance
+```
+
+### Pattern 6: Token Swap via Uniswap
+
+```bash
+# 1. Query current holdings
+elytro query tokens my-wallet
+
+# 2. Invoke defi/uniswap planner (external skill)
+#    → returns { chainId, target, calldata, valueEth } + summary
+
+# 3. Simulate the swap through Elytro
+elytro tx simulate my-wallet --tx "to:$ROUTER,value:$VALUE_ETH,data:$CALLDATA"
+# → check warnings array, verify sponsored status
+
+# 4. Get user approval, then execute
+elytro tx send my-wallet --tx "to:$ROUTER,value:$VALUE_ETH,data:$CALLDATA"
+
+# 5. Verify updated balances
+elytro query balance my-wallet
+elytro query tokens my-wallet
+```
 
 ---
 
@@ -552,50 +1043,73 @@ Some commands are **interactive** and will pause for user input. **All confirmat
 
 When implementing Elytro wallet interactions, ensure:
 
-- [ ] **Ambiguous intent detection**: When user says "open wallet", "打开钱包", "elytro", etc., immediately show Main Menu (Level 0) without asking.
-- [ ] **Real-time data fetching**: Always run `elytro account list`, `elytro query balance`, etc. before rendering UI. Never use placeholder data.
-- [ ] **Inline Button rendering**: All menus, lists, confirmations, and action flows use Telegram Inline Buttons exclusively.
-- [ ] **Back button on all sub-menus**: Every screen below Main Menu includes a "⬅️ Back" button.
-- [ ] **Callback routing**: Parse callback_data prefixes (menu_*, account_select_*, action_*, tx_*, confirm_*) and route to correct handler.
-- [ ] **Multi-step action flows**: For Send and Swap, guide user through account → input → summary → approval steps using Inline Buttons.
-- [ ] **Audit logging**: Log all callback events (callback_data, timestamp, user_id, action taken, result).
-- [ ] **Error handling**: If a command fails (e.g., `elytro tx send` returns error), display error message with a "⬅️ Back" button to retry or return to menu.
+- [ ] **Real-time data fetching**: Always run `elytro query balance`, `elytro account info`, etc. before making decisions. Never use stale or assumed values.
+- [ ] **Security verification**: Before any `tx send`, confirm `hookInstalled: true` and `emailVerified: true`.
+- [ ] **JSON parsing**: All command output is structured JSON. Parse `stdout` and check `success` field.
+- [ ] **Confirmation handling**: When commands pause for `(y/N)`, present the user with a clear summary and wait for explicit approval.
+- [ ] **Error handling**: If a command returns `success: false`, parse the error code and message. Use the Error Recovery table below.
+- [ ] **Chain awareness**: Account operations use the account's chain. Switching accounts may change the active chain. Always verify chain context.
+- [ ] **Balance pre-check**: Before `tx send`, verify the account has enough ETH for the value being sent (sponsor only covers gas).
+- [ ] **Multi-step flows**: For send and swap, follow the full pipeline: query → simulate → confirm → send → verify.
 
 ---
 
-## Inter-Agent Communication & Inline Button Convention
+## Invariants the Agent Must Respect
 
-**All agents using the Elytro skill must follow this Inline Button standard to ensure seamless integration and user experience consistency.**
+1. **Always `init` before anything else.** Every command needs the vault key.
+2. **Always `account create` with `--email` and `--daily-limit`.** No exceptions in production workflows.
+3. **Always `security email bind` after create.** The hook needs a verified email to enforce 2FA.
+4. **Always verify `hookInstalled: true` after activate.** If false, the account is unprotected.
+5. **Never `tx send` without confirmed security.** Check `security status` if in doubt.
+6. **Always `activate` before `tx send`.** Transactions require a deployed contract.
+7. **Fund before `activate` if sponsorship might fail.** The CREATE2 address is deterministic.
+8. **Sponsor covers gas, not value.** If sending ETH, the account needs that ETH.
+9. **Chain is per-account.** Switching accounts may change the active chain.
+10. **Always pass alias/address to `account switch`.** The interactive selector is not agent-compatible.
+11. **Parse JSON from every command.** Success/failure is in the `success` field.
+12. **API keys are never exposed.** All error messages and URLs are sanitized automatically.
+13. **Never guess on-chain data.** Always query before acting.
+14. **`value` is always ETH, not wei.** The CLI handles conversion internally.
 
-### Callback Data Naming Convention
-Agents must adhere to the following callback_data format for cross-agent compatibility:
+---
 
-| Use Case | Callback Format | Example |
-|----------|-----------------|---------|
-| Confirmations | `confirm_yes`, `confirm_no`, `confirm_cancel` | `{ "text": "Approve", "callback_data": "confirm_yes" }` |
-| Account Selection | `account_select_<alias_or_address>` | `{ "text": "myWallet", "callback_data": "account_select_myWallet" }` |
-| Token Selection | `token_select_<tokenAddress_or_symbol>` | `{ "text": "USDC", "callback_data": "token_select_0xA0b8..." }` |
-| Transaction Actions | `tx_approve`, `tx_reject`, `tx_simulate` | `{ "text": "Send", "callback_data": "tx_approve" }` |
-| Action Menu | `action_<action_name>` | `{ "text": "Send ETH", "callback_data": "action_send_eth" }` |
+## Error Recovery
 
-### For Other AI Agents Reading This Skill
-
-**Important:** If you are another AI agent tasked with Elytro wallet operations:
-
-1. **Always use Inline Buttons for confirmations and list displays** — never fall back to text input prompts.
-2. **Follow the callback_data naming convention above** — this ensures consistency across all agents using Elytro.
-3. **When displaying lists** (accounts, tokens, transactions, etc.), render each item as a clickable button with the appropriate callback format.
-4. **Upon receiving a callback**, parse the callback_data and execute the corresponding action (e.g., `confirm_yes` → proceed with tx, `account_select_<alias>` → fetch account details).
-5. **Log all callback events** for audit purposes: timestamp, user_id, callback_data, action taken, result.
-6. **Update this section** if you introduce new callback patterns — keep the standard extensible and well-documented for future agents.
+| Error Pattern                | Cause                                   | Recovery                                |
+| ---------------------------- | --------------------------------------- | --------------------------------------- |
+| "Wallet not initialized"     | No `~/.elytro/keyring.json`             | Run `elytro init`                       |
+| "Keyring is locked"          | Missing vault key (Keychain or env var) | Check Keychain entry or SecretRef       |
+| "Vault key not found"        | Provider available but key missing      | Re-run `elytro init` or check SecretRef |
+| "Wallet unlock failed"       | Wrong vault key                         | Verify the correct key in SecretRef     |
+| "No accounts found"          | No account created yet                  | Run `elytro account create`             |
+| "Account not deployed"       | Trying to send tx before activation     | Run `elytro account activate`           |
+| "Insufficient balance"       | Value exceeds account balance           | Fund the account first                  |
+| JSON-RPC error code `-32001` | Resource not found on-chain             | Check hash/address, try different chain |
+| "AA21" in error              | UserOp simulation failed                | Usually a balance or nonce issue        |
 
 ---
 
 ## Notes
 
-- Elytro uses **EIP-4337 (Account Abstraction)** — transactions are submitted as UserOps via a Bundler, not regular EOA transactions.
-- Sponsored transactions are **gasless by default** when a paymaster is available.
-- The wallet data directory is `~/.elytro`.
+- Elytro uses **EIP-4337 (Account Abstraction)** — transactions are submitted as UserOps via a Bundler, not regular EOA transactions. On-chain, all UserOps appear as bundler (0x4337001F) → EntryPoint (0x4337084D) transactions.
+- Sponsored transactions are **gasless by default** when a paymaster is available. The paymaster covers gas fees only, not the transaction's ETH value.
+- The wallet data directory is `~/.elytro/`. No plaintext key files exist on disk.
 - `--chain` accepts both hex (`0xaa36a7`) and decimal (`11155111`) chain IDs.
-- `data` field in tx spec must be a valid hex string; use `0x` for plain ETH transfers.
-- **Inline Button usage is mandatory** for all user-facing confirmations and list displays in Elytro workflows. This ensures a consistent, modern UX across all agents and reduces friction in high-stakes wallet operations.
+- `data` field in `--tx` specs must be a valid hex string with `0x` prefix and even length. Use `data:0x` (or omit `data`) for plain ETH transfers.
+- The Security Intent / Status two-phase model ensures SecurityHook is installed atomically during deployment. Intent is temporary (create → activate); Status is persistent (post-activate).
+
+---
+
+## Storage Layout
+
+```
+~/.elytro/
+├── keyring.json      # AES-GCM encrypted EOA private key vault
+├── accounts.json     # Account list (alias, address, chainId, index, owner,
+│                     #   deployed, securityIntent?, securityStatus?)
+└── config.json       # Chain config, current chain, API keys (persisted)
+```
+
+No plaintext key files on disk. The vault key lives in macOS Keychain or is injected
+via `ELYTRO_VAULT_SECRET` environment variable. Deleting `~/.elytro/` resets local
+state; on-chain contracts are unaffected.
