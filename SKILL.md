@@ -9,7 +9,7 @@ disable-model-invocation: false
 
 Welcome! The `elytro` CLI prints this URL in `elytro --help` so agents always land on the canonical instructions before touching a wallet. Read this document once, then jump into the sub-skills listed below.
 
-> Raw link surfaced in `elytro --help`: `https://raw.githubusercontent.com/Elytro-eth/skills/main/SKILL.md`
+> Raw link surfaced in `elytro --help`: `https://raw.githubusercontent.com/jayden-sudo/skills/main/SKILL.md`
 
 Need to **swap tokens? Install [`defi/uniswap/SKILL.md`](./defi/uniswap/SKILL.md).**  
 Need to execute another protocol flow? Install that protocol’s folder (e.g., `defi/pendle/SKILL.md`) alongside [`defi/elytro/SKILL.md`](./defi/elytro/SKILL.md).
